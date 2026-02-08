@@ -1,0 +1,29 @@
+replicaCount: 1
+
+image:
+  repository: registry.cn-hangzhou.aliyuncs.com/your-namespace/bff-service
+  tag: latest
+  pullPolicy: Always
+
+service:
+  type: ClusterIP
+  port: 8000
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+database:
+  host: postgresql.default.svc.cluster.local
+  port: 5432
+  name: bff_service
+  username: postgres
+  password: postgres
+
+app:
+  secretKey: change-me-in-production
+  debug: false

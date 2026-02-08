@@ -1,0 +1,8 @@
+BFF Service has been deployed.
+
+Release: {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+Access the service:
+  kubectl port-forward svc/{{ include "bff-service.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  curl http://localhost:{{ .Values.service.port }}/health
