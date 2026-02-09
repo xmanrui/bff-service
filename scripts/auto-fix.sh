@@ -191,15 +191,23 @@ fetch_cluster_logs() {
 "
   done
 
-  # 4. Helm release 状态
-  diag+="========== Helm Release 状态 ==========
+  # 4. Helm 部署时使用的 values
+  diag+="========== Helm Values ==========
 "
-  diag+=$(helm status "${HELM_RELEASE}" -n "${K8S_NAMESPACE}" 2>&1 || echo "(无法获取 Helm 状态)")
+  diag+=$(helm get values "${HELM_RELEASE}" -n "${K8S_NAMESPACE}" 2>&1 || echo "(无法获取 Helm values)")
   diag+="
 
 "
 
-  # 5. Events
+  # 5. Helm 渲染后的 K8s 资源清单
+  diag+="========== Helm Manifest ==========
+"
+  diag+=$(helm get manifest "${HELM_RELEASE}" -n "${K8S_NAMESPACE}" 2>&1 || echo "(无法获取 Helm manifest)")
+  diag+="
+
+"
+
+  # 6. Events
   diag+="========== 最近集群 Events ==========
 "
   diag+=$(kubectl get events -n "${K8S_NAMESPACE}" --sort-by='.lastTimestamp' --field-selector involvedObject.kind=Pod 2>&1 | tail -30)

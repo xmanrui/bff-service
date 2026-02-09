@@ -71,10 +71,13 @@ kubectl logs <pod_name> -n default --tail=80
 # 4. 容器上一次崩溃的日志
 kubectl logs <pod_name> -n default --previous --tail=80
 
-# 5. Helm release 状态
-helm status bff-service -n default
+# 5. Helm 部署时使用的 values（检查配置值是否正确）
+helm get values bff-service -n default
 
-# 6. 最近的集群 Events
+# 6. Helm 渲染后的 K8s 资源清单（检查最终生成的资源是否符合预期）
+helm get manifest bff-service -n default
+
+# 7. 最近的集群 Events
 kubectl get events -n default --sort-by='.lastTimestamp' --field-selector involvedObject.kind=Pod
 ```
 
@@ -102,7 +105,7 @@ kubectl get pods -n default -l "app.kubernetes.io/name=bff-service" -o json
 
 如果 Pod 健康，再等 30 秒做二次稳定性检查。稳定则**告知用户部署成功，结束**。
 
-如果 Pod 异常，收集第三步 B 中列出的 6 项集群诊断信息，分析根因，重点关注：
+如果 Pod 异常，收集第三步 B 中列出的 7 项集群诊断信息，分析根因，重点关注：
 - 应用启动崩溃（代码错误、依赖缺失、配置错误）
 - 健康检查失败（接口未就绪、路径不匹配、超时设置不合理）
 - 资源不足（OOMKilled、CPU throttling）
