@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 #
-# 自动监控 GitHub Actions 部署结果，失败时调用 Claude Code 分析并修复。
+# 自动监控 GitHub Actions 部署结果 + ACK 集群运行状态，
+# 失败时调用 Claude Code 分析并修复。
 #
 # 用法: ./scripts/auto-fix.sh [最大重试次数]
 #
 # 前置条件:
 #   - gh CLI 已登录 (gh auth login)
+#   - kubectl 已配置 ACK 集群 kubeconfig
 #   - claude CLI 已安装
 #   - 当前目录为项目根目录
 #
@@ -13,9 +15,15 @@
 set -euo pipefail
 
 MAX_RETRIES=${1:-3}
-POLL_INTERVAL=30       # 轮询间隔（秒）
+POLL_INTERVAL=30             # GitHub Actions 轮询间隔（秒）
+POD_CHECK_DELAY=60           # GH Actions 成功后等待 Pod 启动的时间（秒）
+POD_STABLE_WAIT=30           # Pod 稳定性观察时间（秒）
 WORKFLOW_FILE="deploy.yaml"
 BRANCH="main"
+HELM_RELEASE="bff-service"
+K8S_NAMESPACE="default"
+BUILD_JOB_NAME="Build & Push Image"
+DEPLOY_JOB_NAME="Deploy to ACK"
 REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner')
 
 retry_count=0
@@ -23,6 +31,8 @@ retry_count=0
 log() {
   echo "[$(date '+%H:%M:%S')] $*"
 }
+
+# ========== GitHub Actions 相关 ==========
 
 # 等待最新的 workflow run 完成，返回结论 (success/failure)
 wait_for_workflow() {
@@ -45,33 +55,226 @@ wait_for_workflow() {
   done
 }
 
-# 获取失败 workflow 的日志
-fetch_failure_logs() {
-  local run_id
-  run_id=$(gh run list --workflow="${WORKFLOW_FILE}" --branch="${BRANCH}" --limit=1 --json databaseId -q '.[0].databaseId')
+# 获取最新 workflow run ID
+get_latest_run_id() {
+  gh run list --workflow="${WORKFLOW_FILE}" --branch="${BRANCH}" --limit=1 --json databaseId -q '.[0].databaseId'
+}
 
+# 判断失败发生在哪个阶段，返回 "build" 或 "deploy"
+get_failed_stage() {
+  local run_id="$1"
+
+  local jobs_json
+  jobs_json=$(gh run view "$run_id" --json jobs)
+
+  local build_conclusion
+  build_conclusion=$(echo "$jobs_json" | jq -r ".jobs[] | select(.name == \"${BUILD_JOB_NAME}\") | .conclusion")
+
+  if [[ "$build_conclusion" != "success" ]]; then
+    echo "build"
+  else
+    echo "deploy"
+  fi
+}
+
+# 获取失败 workflow 的日志
+fetch_workflow_logs() {
+  local run_id="$1"
   log "拉取 workflow run #${run_id} 的失败日志..."
   gh run view "$run_id" --log-failed 2>&1
 }
 
-# 调用 Claude Code 分析日志并修复代码
+# ========== ACK 集群相关 ==========
+
+# 检查 Pod 健康状态，返回 "healthy" 或 "unhealthy"
+check_pod_health() {
+  local delay="${1:-$POD_CHECK_DELAY}"
+
+  if [[ "$delay" -gt 0 ]]; then
+    log "等待 ${delay}s 让 Pod 完成启动..."
+    sleep "$delay"
+  fi
+
+  log "检查 ACK 集群中 Pod 状态..."
+
+  local pods_json
+  pods_json=$(kubectl get pods -n "${K8S_NAMESPACE}" -l "app.kubernetes.io/name=${HELM_RELEASE}" -o json 2>&1)
+
+  # 检查是否有 Pod
+  local pod_count
+  pod_count=$(echo "$pods_json" | jq '.items | length')
+  if [[ "$pod_count" -eq 0 ]]; then
+    log "未找到任何 Pod"
+    echo "unhealthy"
+    return
+  fi
+
+  # 检查所有 Pod 是否 Running 且所有容器 Ready
+  local not_ready
+  not_ready=$(echo "$pods_json" | jq '[.items[] | select(
+    .status.phase != "Running" or
+    (.status.containerStatuses // [] | any(.ready == false)) or
+    (.status.containerStatuses // [] | any(.restartCount > 2))
+  )] | length')
+
+  if [[ "$not_ready" -gt 0 ]]; then
+    log "发现 ${not_ready} 个异常 Pod"
+    echo "unhealthy"
+    return
+  fi
+
+  # 再等一段时间观察是否稳定（防止刚启动就崩溃的情况）
+  log "Pod 看起来正常，等待 ${POD_STABLE_WAIT}s 观察稳定性..."
+  sleep "$POD_STABLE_WAIT"
+
+  not_ready=$(kubectl get pods -n "${K8S_NAMESPACE}" -l "app.kubernetes.io/name=${HELM_RELEASE}" -o json | jq '[.items[] | select(
+    .status.phase != "Running" or
+    (.status.containerStatuses // [] | any(.ready == false)) or
+    (.status.containerStatuses // [] | any(.restartCount > 2))
+  )] | length')
+
+  if [[ "$not_ready" -gt 0 ]]; then
+    log "稳定性检查失败，${not_ready} 个 Pod 异常"
+    echo "unhealthy"
+    return
+  fi
+
+  echo "healthy"
+}
+
+# 收集 ACK 集群中的故障诊断信息
+fetch_cluster_logs() {
+  local diag=""
+
+  log "收集 ACK 集群诊断信息..."
+
+  # 1. Pod 状态概览
+  diag+="========== Pod 状态 ==========
+"
+  diag+=$(kubectl get pods -n "${K8S_NAMESPACE}" -l "app.kubernetes.io/name=${HELM_RELEASE}" -o wide 2>&1)
+  diag+="
+
+"
+
+  # 2. 异常 Pod 的详细描述（Events 等）
+  local problem_pods
+  problem_pods=$(kubectl get pods -n "${K8S_NAMESPACE}" -l "app.kubernetes.io/name=${HELM_RELEASE}" \
+    --field-selector=status.phase!=Running -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+
+  # 如果没有非 Running 的 Pod，取所有 Pod（可能是 CrashLoopBackOff 但 phase 仍是 Running）
+  if [[ -z "$problem_pods" ]]; then
+    problem_pods=$(kubectl get pods -n "${K8S_NAMESPACE}" -l "app.kubernetes.io/name=${HELM_RELEASE}" \
+      -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+  fi
+
+  for pod in $problem_pods; do
+    diag+="========== Pod 描述: ${pod} ==========
+"
+    diag+=$(kubectl describe pod "${pod}" -n "${K8S_NAMESPACE}" 2>&1 | tail -40)
+    diag+="
+
+"
+
+    # 3. 容器日志（当前 + 上一次崩溃的）
+    diag+="========== Pod 日志: ${pod} ==========
+"
+    diag+=$(kubectl logs "${pod}" -n "${K8S_NAMESPACE}" --tail=80 2>&1)
+    diag+="
+
+"
+
+    diag+="========== Pod 上次崩溃日志: ${pod} ==========
+"
+    diag+=$(kubectl logs "${pod}" -n "${K8S_NAMESPACE}" --previous --tail=80 2>&1 || echo "(无上次崩溃日志)")
+    diag+="
+
+"
+  done
+
+  # 4. Helm release 状态
+  diag+="========== Helm Release 状态 ==========
+"
+  diag+=$(helm status "${HELM_RELEASE}" -n "${K8S_NAMESPACE}" 2>&1 || echo "(无法获取 Helm 状态)")
+  diag+="
+
+"
+
+  # 5. Events
+  diag+="========== 最近集群 Events ==========
+"
+  diag+=$(kubectl get events -n "${K8S_NAMESPACE}" --sort-by='.lastTimestamp' --field-selector involvedObject.kind=Pod 2>&1 | tail -30)
+
+  echo "$diag"
+}
+
+# ========== Claude Code 调用 ==========
+
 claude_fix() {
-  local logs="$1"
+  local error_source="$1"  # "build" / "deploy" / "runtime"
+  local logs="$2"
   local prompt
-  prompt=$(cat <<PROMPT
-以下是 GitHub Actions 部署失败的日志:
+
+  if [[ "$error_source" == "build" ]]; then
+    prompt=$(cat <<PROMPT
+以下是 GitHub Actions 构建阶段失败的日志:
 
 \`\`\`
 ${logs}
 \`\`\`
 
-请分析失败原因，修改项目中的相关代码文件来修复这个问题。
+错误发生在 CI 构建阶段（Docker 镜像构建/推送），请分析失败原因。
 修复后请用 git 提交更改并 push 到远程仓库。
 提交信息格式: "fix: 修复描述"
 PROMPT
 )
 
-  log "调用 Claude Code 分析并修复..."
+  elif [[ "$error_source" == "deploy" ]]; then
+    prompt=$(cat <<PROMPT
+GitHub Actions 构建成功，但在部署阶段失败。以下是两部分诊断信息：
+
+=== 第一部分：GitHub Actions 部署阶段的错误日志 ===
+
+\`\`\`
+${logs}
+\`\`\`
+
+=== 第二部分：ACK 集群诊断信息（Pod 状态、Events、容器日志等）===
+
+\`\`\`
+${CLUSTER_DIAG}
+\`\`\`
+
+部署阶段失败的根因可能在 CI 日志中（如 Helm 模板错误），也可能需要结合集群信息才能定位（如 Pod 启动失败、探针超时）。
+请综合两部分信息分析根因，修改项目中的相关代码文件来修复问题。
+修复后请用 git 提交更改并 push 到远程仓库。
+提交信息格式: "fix: 修复描述"
+PROMPT
+)
+
+  else
+    prompt=$(cat <<PROMPT
+GitHub Actions 构建和部署均成功，但应用在 ACK 集群中运行异常。
+以下是从集群中收集的诊断信息（包含 Pod 状态、Events、容器日志等）:
+
+\`\`\`
+${logs}
+\`\`\`
+
+请根据以上集群诊断信息，结合项目代码分析根因。常见原因包括：
+- 应用启动崩溃（代码错误、依赖缺失、配置错误）
+- 健康检查失败（接口未就绪、路径不匹配、超时）
+- 资源不足（OOMKilled、CPU 限制过低）
+- 环境变量/Secret 配置缺失或错误
+- 镜像拉取失败（地址错误、认证问题）
+
+定位根因后修改对应文件修复问题。
+修复后请用 git 提交更改并 push 到远程仓库。
+提交信息格式: "fix: 修复描述"
+PROMPT
+)
+  fi
+
+  log "调用 Claude Code 分析并修复 (错误来源: ${error_source})..."
   claude --print --dangerously-skip-permissions "$prompt"
 }
 
@@ -82,30 +285,59 @@ log "开始监控 ${REPO} 的部署流程 (最大重试: ${MAX_RETRIES})"
 while [[ $retry_count -lt $MAX_RETRIES ]]; do
   conclusion=$(wait_for_workflow)
 
-  if [[ "$conclusion" == "success" ]]; then
-    log "部署成功!"
-    exit 0
-  fi
+  if [[ "$conclusion" == "failure" ]]; then
+    retry_count=$((retry_count + 1))
+    run_id=$(get_latest_run_id)
+    failed_stage=$(get_failed_stage "$run_id")
 
-  retry_count=$((retry_count + 1))
-  log "部署失败 (第 ${retry_count}/${MAX_RETRIES} 次尝试)"
+    if [[ "$failed_stage" == "build" ]]; then
+      # ---- 场景 1: 构建阶段失败，只看 CI 日志 ----
+      log "构建阶段失败 (第 ${retry_count}/${MAX_RETRIES} 次尝试)"
 
-  # 拉取失败日志
-  failure_logs=$(fetch_failure_logs)
+      ci_logs=$(fetch_workflow_logs "$run_id")
+      trimmed_logs=$(echo "$ci_logs" | tail -200)
+      claude_fix "build" "$trimmed_logs"
 
-  if [[ -z "$failure_logs" ]]; then
-    log "无法获取失败日志，退出"
+    else
+      # ---- 场景 2: 部署阶段失败，CI 日志 + 集群诊断 ----
+      log "部署阶段失败 (第 ${retry_count}/${MAX_RETRIES} 次尝试)"
+
+      ci_logs=$(fetch_workflow_logs "$run_id")
+      trimmed_ci_logs=$(echo "$ci_logs" | tail -200)
+
+      log "同时收集 ACK 集群诊断信息..."
+      CLUSTER_DIAG=$(fetch_cluster_logs | tail -300)
+      export CLUSTER_DIAG
+
+      claude_fix "deploy" "$trimmed_ci_logs"
+    fi
+
+  elif [[ "$conclusion" == "success" ]]; then
+    # ---- 场景 3: CI 全部成功，检查集群 Pod 健康 ----
+    log "GitHub Actions 成功，开始检查 ACK 集群 Pod 状态..."
+
+    pod_status=$(check_pod_health)
+
+    if [[ "$pod_status" == "healthy" ]]; then
+      log "部署成功! Pod 运行正常。"
+      exit 0
+    fi
+
+    # Pod 异常，收集集群诊断信息
+    retry_count=$((retry_count + 1))
+    log "Pod 运行异常 (第 ${retry_count}/${MAX_RETRIES} 次尝试)"
+
+    cluster_logs=$(fetch_cluster_logs)
+    trimmed_logs=$(echo "$cluster_logs" | tail -300)
+    claude_fix "runtime" "$trimmed_logs"
+
+  else
+    log "未知 workflow 结论: ${conclusion}，退出"
     exit 1
   fi
 
-  # 截取日志避免过长（保留最后 200 行）
-  trimmed_logs=$(echo "$failure_logs" | tail -200)
-
-  # 调用 Claude Code 修复
-  claude_fix "$trimmed_logs"
-
   log "修复已提交，等待新一轮部署..."
-  sleep 10  # 等待 GitHub Actions 检测到新 push
+  sleep 10
 done
 
 log "已达到最大重试次数 (${MAX_RETRIES})，退出"
