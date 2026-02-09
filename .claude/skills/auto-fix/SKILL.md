@@ -62,14 +62,15 @@ gh run view <run_id> --log-failed
 # 1. Pod 状态概览
 kubectl get pods -n default -l "app.kubernetes.io/name=bff-service" -o wide
 
-# 2. 异常 Pod 的详细描述（重点看 Events 和 State）
+# 2. 异常 Pod 的详细描述（重点看 Events 和 State，最多采集 3 个 Pod）
 kubectl describe pod <pod_name> -n default
 
-# 3. 容器当前日志
-kubectl logs <pod_name> -n default --tail=80
+# 3. 容器当前日志（最多采集 3 个 Pod，智能截取：围绕错误关键字取前 20 行 + 后 100 行，总计不超过 120 行；无关键字则取最后 120 行）
+kubectl logs <pod_name> -n default --tail=500
+# 然后用错误关键字（Error|Exception|Traceback|FATAL|panic|OOMKilled 等）定位截取
 
-# 4. 容器上一次崩溃的日志
-kubectl logs <pod_name> -n default --previous --tail=80
+# 4. 容器上一次崩溃的日志（同上智能截取策略）
+kubectl logs <pod_name> -n default --previous --tail=500
 
 # 5. Helm 部署时使用的 values（检查配置值是否正确）
 helm get values bff-service -n default

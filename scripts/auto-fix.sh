@@ -86,6 +86,49 @@ fetch_workflow_logs() {
 
 # ========== ACK 集群相关 ==========
 
+# 错误关键字模式
+ERROR_PATTERN="Error|Exception|Traceback|FATAL|CRITICAL|panic|OOMKilled|CrashLoopBackOff|ImagePullBackOff|Failed|Errno|killed|timeout|refused"
+
+# 智能日志截取：围绕错误关键字截取上下文，找不到则取最后 N 行
+# 用法: smart_tail <全量日志> <总行数上限> <关键字前行数> <关键字后行数>
+smart_tail() {
+  local full_log="$1"
+  local max_lines="${2:-120}"
+  local before="${3:-20}"
+  local after="${4:-100}"
+
+  if [[ -z "$full_log" ]]; then
+    echo "(无日志)"
+    return
+  fi
+
+  # 查找最后一个匹配错误关键字的行号
+  local match_line
+  match_line=$(echo "$full_log" | grep -n -E "$ERROR_PATTERN" | tail -1 | cut -d: -f1)
+
+  if [[ -n "$match_line" ]]; then
+    # 找到关键字：取关键字前 before 行 + 关键字后 after 行，总数不超过 max_lines
+    local total_lines
+    total_lines=$(echo "$full_log" | wc -l | tr -d ' ')
+
+    local start=$((match_line - before))
+    [[ $start -lt 1 ]] && start=1
+
+    local end=$((match_line + after))
+    [[ $end -gt $total_lines ]] && end=$total_lines
+
+    # 确保不超过 max_lines
+    if [[ $((end - start + 1)) -gt $max_lines ]]; then
+      end=$((start + max_lines - 1))
+    fi
+
+    echo "$full_log" | sed -n "${start},${end}p"
+  else
+    # 未找到关键字：取最后 max_lines 行
+    echo "$full_log" | tail -"$max_lines"
+  fi
+}
+
 # 检查 Pod 健康状态，返回 "healthy" 或 "unhealthy"
 check_pod_health() {
   local delay="${1:-$POD_CHECK_DELAY}"
@@ -167,7 +210,17 @@ fetch_cluster_logs() {
       -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
   fi
 
+  # 最多采集 3 个 Pod 实例的日志，同一 Deployment 的 Pod 崩溃原因通常相同
+  local pod_count=0
+  local max_pods=3
+
   for pod in $problem_pods; do
+    if [[ $pod_count -ge $max_pods ]]; then
+      diag+="(已达到最大采集数 ${max_pods}，剩余 Pod 省略)
+"
+      break
+    fi
+    pod_count=$((pod_count + 1))
     diag+="========== Pod 描述: ${pod} ==========
 "
     diag+=$(kubectl describe pod "${pod}" -n "${K8S_NAMESPACE}" 2>&1 | tail -40)
@@ -178,14 +231,22 @@ fetch_cluster_logs() {
     # 3. 容器日志（当前 + 上一次崩溃的）
     diag+="========== Pod 日志: ${pod} ==========
 "
-    diag+=$(kubectl logs "${pod}" -n "${K8S_NAMESPACE}" --tail=80 2>&1)
+    local raw_logs
+    raw_logs=$(kubectl logs "${pod}" -n "${K8S_NAMESPACE}" --tail=500 2>&1)
+    diag+=$(smart_tail "$raw_logs" 120 20 100)
     diag+="
 
 "
 
     diag+="========== Pod 上次崩溃日志: ${pod} ==========
 "
-    diag+=$(kubectl logs "${pod}" -n "${K8S_NAMESPACE}" --previous --tail=80 2>&1 || echo "(无上次崩溃日志)")
+    local raw_prev_logs
+    raw_prev_logs=$(kubectl logs "${pod}" -n "${K8S_NAMESPACE}" --previous --tail=500 2>&1 || echo "")
+    if [[ -n "$raw_prev_logs" ]]; then
+      diag+=$(smart_tail "$raw_prev_logs" 120 20 100)
+    else
+      diag+="(无上次崩溃日志)"
+    fi
     diag+="
 
 "
