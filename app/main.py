@@ -18,7 +18,7 @@ WELCOME_HTML = """<!DOCTYPE html>
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     min-height: 100vh;
     display: flex; align-items: center; justify-content: center;
-    background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+    background: linear-gradient(135deg, #e65100, #ff9800, #ffb74d);
     color: #fff;
   }
   .container { text-align: center; padding: 2rem; }
