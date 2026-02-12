@@ -17,6 +17,8 @@
   .logo { font-size: 4rem; margin-bottom: 1rem; }
   h1 { font-size: 2.5rem; margin-bottom: 0.5rem; }
   .subtitle { font-size: 1.1rem; color: #b0c4de; margin-bottom: 2rem; }
+  .joke { font-size: 1rem; color: #cce0ff; margin-bottom: 2rem; cursor: pointer; max-width: 500px; margin-left: auto; margin-right: auto; }
+  .joke:hover { color: #fff; }
   .links { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }
   .links a {
     padding: 0.6rem 1.5rem; border-radius: 8px;
@@ -30,9 +32,11 @@
 </head>
 <body>
 <div class="container">
-  <div class="logo">🚀</div>
+  <div class="logo">🧧</div>
   <h1>Hello world!</h1>
+  <p class="subtitle">🎆 新春快乐，万事如意！🎆</p>
   <p class="subtitle">Built with FastAPI · Ready to serve</p>
+  <p class="joke" id="joke" onclick="nextJoke()">Loading joke...</p>
   <div class="links">
     <a href="/docs">📖 API Docs</a>
     <a href="/redoc">📚 ReDoc</a>
@@ -42,5 +46,25 @@
   </div>
   <p class="status">✅ Service is running</p>
 </div>
+<script>
+const jokes = [
+  "为什么程序员总是分不清万圣节和圣诞节？因为 Oct 31 == Dec 25。",
+  "Java 和 JavaScript 有什么关系？就像雷锋和雷峰塔的关系。",
+  "为什么程序员不喜欢户外？因为有太多 bug。",
+  "一个 SQL 语句走进酒吧，看到两张 table，问：Can I JOIN you?",
+  "为什么前端程序员吃饭不用筷子？因为他们只会用 div。",
+  "程序员最讨厌的电影？《无间道》——因为死循环。",
+  "为什么 C 语言程序员戴眼镜？因为他们看不到 C#。",
+  "HTTP 是什么意思？How To Teach People（如何教人）。",
+  "为什么程序员总是把圣诞节和万圣节搞混？因为他们觉得 25 Dec == 31 Oct。",
+  "老板：这个 bug 什么时候能修好？程序员：等它变成 feature 就好了。",
+  "为什么北极熊不吃企鹅？因为它打不开包装。",
+  "我跟我的代码说了一个笑话，它没反应——大概是没有 sense of humor，只有 syntax error。"
+];
+function nextJoke() {
+  document.getElementById('joke').textContent = '😄 ' + jokes[Math.floor(Math.random() * jokes.length)];
+}
+nextJoke();
+</script>
 </body>
 </html>
