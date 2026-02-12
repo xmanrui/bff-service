@@ -38,7 +38,7 @@ export default function App() {
   return (
     <div
       className="relative min-h-screen flex items-center justify-center"
-      style={{ background: 'linear-gradient(135deg, #b71c1c, #d32f2f, #e53935)' }}
+      style={{ background: 'linear-gradient(135deg, #1b5e20, #2e7d32, #66bb6a)' }}
     >
       <Fireworks />
 

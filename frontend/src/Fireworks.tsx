@@ -67,7 +67,7 @@ export default function Fireworks() {
     }
 
     function loop(time: number) {
-      ctx.globalCompositeOperation = 'source-over'
+      ctx.globalCompositeOperation = 'destination-out'
       ctx.fillStyle = 'rgba(0,0,0,0.15)'
       ctx.fillRect(0, 0, canvas.width, canvas.height)
       ctx.globalCompositeOperation = 'lighter'
